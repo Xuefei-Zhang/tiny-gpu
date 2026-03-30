@@ -1,6 +1,7 @@
 from typing import List
 from .logger import logger
 
+
 class Memory:
     def __init__(self, dut, addr_bits, data_bits, channels, name):
         self.dut = dut
@@ -21,14 +22,14 @@ class Memory:
             self.mem_write_data = getattr(dut, f"{name}_mem_write_data")
             self.mem_write_ready = getattr(dut, f"{name}_mem_write_ready")
 
-    def run(self):
+    def run(self, cycle=None):
         mem_read_valid = [
-            int(str(self.mem_read_valid.value)[i:i+1], 2)
+            int(str(self.mem_read_valid.value)[i : i + 1], 2)
             for i in range(0, len(str(self.mem_read_valid.value)), 1)
         ]
 
         mem_read_address = [
-            int(str(self.mem_read_address.value)[i:i+self.addr_bits], 2)
+            int(str(self.mem_read_address.value)[i : i + self.addr_bits], 2)
             for i in range(0, len(str(self.mem_read_address.value)), self.addr_bits)
         ]
         mem_read_ready = [0] * self.channels
@@ -41,32 +42,46 @@ class Memory:
             else:
                 mem_read_ready[i] = 0
 
-        self.mem_read_data.value = int(''.join(format(d, '0' + str(self.data_bits) + 'b') for d in mem_read_data), 2)
-        self.mem_read_ready.value = int(''.join(format(r, '01b') for r in mem_read_ready), 2)
+        self.mem_read_data.value = int(
+            "".join(format(d, "0" + str(self.data_bits) + "b") for d in mem_read_data),
+            2,
+        )
+        self.mem_read_ready.value = int(
+            "".join(format(r, "01b") for r in mem_read_ready), 2
+        )
 
         if self.name != "program":
             mem_write_valid = [
-                int(str(self.mem_write_valid.value)[i:i+1], 2)
+                int(str(self.mem_write_valid.value)[i : i + 1], 2)
                 for i in range(0, len(str(self.mem_write_valid.value)), 1)
             ]
             mem_write_address = [
-                int(str(self.mem_write_address.value)[i:i+self.addr_bits], 2)
-                for i in range(0, len(str(self.mem_write_address.value)), self.addr_bits)
+                int(str(self.mem_write_address.value)[i : i + self.addr_bits], 2)
+                for i in range(
+                    0, len(str(self.mem_write_address.value)), self.addr_bits
+                )
             ]
             mem_write_data = [
-                int(str(self.mem_write_data.value)[i:i+self.data_bits], 2)
+                int(str(self.mem_write_data.value)[i : i + self.data_bits], 2)
                 for i in range(0, len(str(self.mem_write_data.value)), self.data_bits)
             ]
             mem_write_ready = [0] * self.channels
 
             for i in range(self.channels):
                 if mem_write_valid[i] == 1:
+                    old_data = self.memory[mem_write_address[i]]
                     self.memory[mem_write_address[i]] = mem_write_data[i]
+                    logger.debug(
+                        f"[memwrite] {self.name} cycle={cycle if cycle is not None else -1} "
+                        f"lane={i} addr={mem_write_address[i]} old={old_data} new={mem_write_data[i]}"
+                    )
                     mem_write_ready[i] = 1
                 else:
                     mem_write_ready[i] = 0
 
-            self.mem_write_ready.value = int(''.join(format(w, '01b') for w in mem_write_ready), 2)
+            self.mem_write_ready.value = int(
+                "".join(format(w, "01b") for w in mem_write_ready), 2
+            )
 
     def write(self, address, data):
         if address < len(self.memory):
@@ -79,7 +94,7 @@ class Memory:
     def display(self, rows, decimal=True):
         logger.info("\n")
         logger.info(f"{self.name.upper()} MEMORY")
-        
+
         table_size = (8 * 2) + 3
         logger.info("+" + "-" * (table_size - 3) + "+")
 
@@ -93,7 +108,7 @@ class Memory:
                     row = f"| {i:<4} | {data:<4}"
                     logger.info(row + " " * (table_size - len(row) - 1) + "|")
                 else:
-                    data_bin = format(data, f'0{16}b')
+                    data_bin = format(data, f"0{16}b")
                     row = f"| {i:<4} | {data_bin} |"
                     logger.info(row + " " * (table_size - len(row) - 1) + "|")
         logger.info("+" + "-" * (table_size - 3) + "+")
