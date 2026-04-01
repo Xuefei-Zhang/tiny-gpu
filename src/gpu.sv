@@ -2,11 +2,15 @@
 `timescale 1ns/1ns
 
 // GPU
-// > Built to use an external async memory with multi-channel read/write
-// > Assumes that the program is loaded into program memory, data into data memory, and threads into
-//   the device control register before the start signal is triggered
-// > Has memory controllers to interface between external memory and its multiple cores
-// > Configurable number of cores and thread capacity per core
+// > Top-level wrapper that wires together launch control, dispatch, cores, and memory controllers.
+// > Assumes software/testbench has already:
+//   1. loaded program memory,
+//   2. loaded data memory,
+//   3. written thread_count into the device control register,
+//   4. pulsed start.
+// > Beginner mental model:
+//   this file is mostly plumbing. It does not add new execution behavior so much as connect the
+//   major subsystems into one device.
 module gpu #(
     parameter DATA_MEM_ADDR_BITS = 8,        // Number of bits in data memory address (256 rows)
     parameter DATA_MEM_DATA_BITS = 8,        // Number of bits in data memory value (8 bit data)
@@ -20,21 +24,21 @@ module gpu #(
     input wire clk,
     input wire reset,
 
-    // Kernel Execution
+    // External kernel launch handshake.
     input wire start,
     output wire done,
 
-    // Device Control Register
+    // Software-visible launch configuration write port.
     input wire device_control_write_enable,
     input wire [7:0] device_control_data,
 
-    // Program Memory
+    // External program-memory interface.
     output wire [PROGRAM_MEM_NUM_CHANNELS-1:0] program_mem_read_valid,
     output wire [PROGRAM_MEM_ADDR_BITS-1:0] program_mem_read_address [PROGRAM_MEM_NUM_CHANNELS-1:0],
     input wire [PROGRAM_MEM_NUM_CHANNELS-1:0] program_mem_read_ready,
     input wire [PROGRAM_MEM_DATA_BITS-1:0] program_mem_read_data [PROGRAM_MEM_NUM_CHANNELS-1:0],
 
-    // Data Memory
+    // External data-memory interface.
     output wire [DATA_MEM_NUM_CHANNELS-1:0] data_mem_read_valid,
     output wire [DATA_MEM_ADDR_BITS-1:0] data_mem_read_address [DATA_MEM_NUM_CHANNELS-1:0],
     input wire [DATA_MEM_NUM_CHANNELS-1:0] data_mem_read_ready,
@@ -44,17 +48,18 @@ module gpu #(
     output wire [DATA_MEM_DATA_BITS-1:0] data_mem_write_data [DATA_MEM_NUM_CHANNELS-1:0],
     input wire [DATA_MEM_NUM_CHANNELS-1:0] data_mem_write_ready
 );
-    // Control
+    // Launch metadata produced by the device control register.
     wire [7:0] thread_count;
 
-    // Compute Core State
+    // Dispatcher-managed per-core launch/status signals.
     reg [NUM_CORES-1:0] core_start;
     reg [NUM_CORES-1:0] core_reset;
     reg [NUM_CORES-1:0] core_done;
     reg [7:0] core_block_id [NUM_CORES-1:0];
     reg [$clog2(THREADS_PER_BLOCK):0] core_thread_count [NUM_CORES-1:0];
 
-    // LSU <> Data Memory Controller Channels
+    // Flattened LSU <-> data-memory-controller wiring.
+    // There is one LSU per thread slot per core, so total LSU count is NUM_CORES * THREADS_PER_BLOCK.
     localparam NUM_LSUS = NUM_CORES * THREADS_PER_BLOCK;
     reg [NUM_LSUS-1:0] lsu_read_valid;
     reg [DATA_MEM_ADDR_BITS-1:0] lsu_read_address [NUM_LSUS-1:0];
@@ -65,14 +70,14 @@ module gpu #(
     reg [DATA_MEM_DATA_BITS-1:0] lsu_write_data [NUM_LSUS-1:0];
     reg [NUM_LSUS-1:0] lsu_write_ready;
 
-    // Fetcher <> Program Memory Controller Channels
+    // Flattened fetcher <-> program-memory-controller wiring.
     localparam NUM_FETCHERS = NUM_CORES;
     reg [NUM_FETCHERS-1:0] fetcher_read_valid;
     reg [PROGRAM_MEM_ADDR_BITS-1:0] fetcher_read_address [NUM_FETCHERS-1:0];
     reg [NUM_FETCHERS-1:0] fetcher_read_ready;
     reg [PROGRAM_MEM_DATA_BITS-1:0] fetcher_read_data [NUM_FETCHERS-1:0];
     
-    // Device Control Register
+    // Stores the total thread_count for the next launch.
     dcr dcr_instance (
         .clk(clk),
         .reset(reset),
@@ -82,7 +87,7 @@ module gpu #(
         .thread_count(thread_count)
     );
 
-    // Data Memory Controller
+    // Arbitrates all LSU traffic onto the external data-memory channels.
     controller #(
         .ADDR_BITS(DATA_MEM_ADDR_BITS),
         .DATA_BITS(DATA_MEM_DATA_BITS),
@@ -111,7 +116,7 @@ module gpu #(
         .mem_write_ready(data_mem_write_ready)
     );
 
-    // Program Memory Controller
+    // Arbitrates per-core fetch traffic onto the external program-memory channels.
     controller #(
         .ADDR_BITS(PROGRAM_MEM_ADDR_BITS),
         .DATA_BITS(PROGRAM_MEM_DATA_BITS),
@@ -133,7 +138,7 @@ module gpu #(
         .mem_read_data(program_mem_read_data),
     );
 
-    // Dispatcher
+    // Splits total thread_count into blocks and assigns them to free cores.
     dispatch #(
         .NUM_CORES(NUM_CORES),
         .THREADS_PER_BLOCK(THREADS_PER_BLOCK)
@@ -150,12 +155,14 @@ module gpu #(
         .done(done)
     );
 
-    // Compute Cores
+    // Instantiate the compute cores and bridge each core's local LSU bundle into the flattened
+    // global controller-facing LSU arrays.
     genvar i;
     generate
         for (i = 0; i < NUM_CORES; i = i + 1) begin : cores
-            // EDA: We create separate signals here to pass to cores because of a requirement
-            // by the OpenLane EDA flow (uses Verilog 2005) that prevents slicing the top-level signals
+            // OpenLane / Verilog-2005 compatibility note:
+            // separate local arrays are introduced here because that flow dislikes directly slicing
+            // some top-level packed/unpacked combinations when passing them into submodules.
             reg [THREADS_PER_BLOCK-1:0] core_lsu_read_valid;
             reg [DATA_MEM_ADDR_BITS-1:0] core_lsu_read_address [THREADS_PER_BLOCK-1:0];
             reg [THREADS_PER_BLOCK-1:0] core_lsu_read_ready;
@@ -165,11 +172,13 @@ module gpu #(
             reg [DATA_MEM_DATA_BITS-1:0] core_lsu_write_data [THREADS_PER_BLOCK-1:0];
             reg [THREADS_PER_BLOCK-1:0] core_lsu_write_ready;
 
-            // Pass through signals between LSUs and data memory controller
+            // Bridge this core's per-thread LSU ports into the flattened global LSU arrays.
+            // lsu_index computes the unique global LSU slot for core i, thread lane j.
             genvar j;
             for (j = 0; j < THREADS_PER_BLOCK; j = j + 1) begin
                 localparam lsu_index = i * THREADS_PER_BLOCK + j;
                 always @(posedge clk) begin 
+                    // Core -> controller direction.
                     lsu_read_valid[lsu_index] <= core_lsu_read_valid[j];
                     lsu_read_address[lsu_index] <= core_lsu_read_address[j];
 
@@ -177,13 +186,14 @@ module gpu #(
                     lsu_write_address[lsu_index] <= core_lsu_write_address[j];
                     lsu_write_data[lsu_index] <= core_lsu_write_data[j];
                     
+                    // Controller -> core direction.
                     core_lsu_read_ready[j] <= lsu_read_ready[lsu_index];
                     core_lsu_read_data[j] <= lsu_read_data[lsu_index];
                     core_lsu_write_ready[j] <= lsu_write_ready[lsu_index];
                 end
             end
 
-            // Compute Core
+            // One compute core instance.
             core #(
                 .DATA_MEM_ADDR_BITS(DATA_MEM_ADDR_BITS),
                 .DATA_MEM_DATA_BITS(DATA_MEM_DATA_BITS),
