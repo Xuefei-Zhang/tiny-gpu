@@ -13,6 +13,11 @@
 //   6. UPDATE  - write registers/NZP and commit next PC
 // > Important simplification: the scheduler assumes all active threads reconverge to one PC.
 //   Real GPUs must handle branch divergence much more carefully.
+// 新手导读：
+// 1. 这个模块是一个“核心级大状态机”，决定一个 core 当前在取指、译码、访存还是回写。
+// 2. 它不是线程调度器意义上的复杂 GPU warp scheduler，而是这个教学工程里的每指令节拍控制器。
+// 3. 其他模块大多会看 `core_state`，只在指定阶段做自己的工作，所以你可以把它当成全局节拍器。
+// 4. `next_pc` 是一个数组，表示每个线程 lane 各自算出来的下一条 PC；这里最后只选一个代表值。
 module scheduler #(
     parameter THREADS_PER_BLOCK = 4,
 ) (
@@ -38,6 +43,7 @@ module scheduler #(
     output reg done
 );
     // Core-wide stage encodings.
+    // 这些状态名帮助你把整个 core 的执行流程按时序串起来看。
     localparam IDLE = 3'b000, // Waiting to start
         FETCH = 3'b001,       // Fetch instructions from program memory
         DECODE = 3'b010,      // Decode instructions into control signals
@@ -53,6 +59,7 @@ module scheduler #(
             core_state <= IDLE;
             done <= 0;
         end else begin 
+            // 典型有限状态机主干：当前状态不同，下一拍转移规则也不同。
             case (core_state)
                 IDLE: begin
                     // Reset entry point before a block begins.
@@ -78,9 +85,11 @@ module scheduler #(
                 WAIT: begin
                     // For non-memory instructions, the LSUs stay idle and this stage exits quickly.
                     // For loads/stores, wait until every active LSU has finished.
+                    // 这里在 always 块内部声明局部变量，是 SystemVerilog 允许的写法。
                     reg any_lsu_waiting = 1'b0;
                     for (int i = 0; i < THREADS_PER_BLOCK; i++) begin
                         // REQUESTING or WAITING means this thread still has an in-flight memory op.
+                        // `for (...)` 在这里是“描述硬件中的重复检查逻辑”，不是软件里那种耗时循环概念。
                         if (lsu_state[i] == 2'b01 || lsu_state[i] == 2'b10) begin
                             any_lsu_waiting = 1'b1;
                             break;
@@ -104,6 +113,7 @@ module scheduler #(
                     end else begin 
                         // Major simplification: just trust that all active threads computed the same
                         // next PC, and pick one representative value.
+                        // 这里直接取 `next_pc[THREADS_PER_BLOCK-1]`，前提是所有活跃线程已经重新收敛到同一个控制流。
                         current_pc <= next_pc[THREADS_PER_BLOCK-1];
 
                         // Begin the next instruction.

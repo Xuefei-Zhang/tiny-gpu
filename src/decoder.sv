@@ -8,6 +8,12 @@
 // > Beginner mental model:
 //   the decoder is the "meaning extractor" for the raw instruction bits. It does not
 //   perform the work itself; it tells the other units what kind of work to do next.
+// 新手导读：
+// 1. 译码器的核心工作是“看 instruction 的不同 bit 段，然后产出控制信号”。
+// 2. `instruction[15:12]` 这种写法表示取位切片；这里高 4 bit 被当成 opcode。
+// 3. 同一条 16 bit 指令，不同模块会复用其中某些字段，例如 rd/rs/rt/immediate/nzp。
+// 4. 这个模块在 DECODE 阶段才更新，因此其他模块默认在后续阶段消费这些控制信号。
+// 5. 先把所有控制信号清零、再按 opcode 拉高需要的信号，是硬件里很常见的防“脏状态残留”写法。
 module decoder (
     input wire clk,
     input wire reset,
@@ -37,6 +43,7 @@ module decoder (
     output reg decoded_ret
 );
     // Opcode table. instruction[15:12] selects one of these operations.
+    // 这些名字是给 opcode 编码取别名，方便后面的 case 语句阅读。
     localparam NOP = 4'b0000,
         BRnzp = 4'b0001,
         CMP = 4'b0010,
@@ -72,6 +79,7 @@ module decoder (
                 // Split the instruction into its reusable fields.
                 // Different instruction formats overlap these bit positions, so the same raw
                 // slices are later interpreted differently by different instructions.
+                // `decoded_rd_address <= instruction[11:8];` 这种写法就是“把位段直接拆出来”。
                 decoded_rd_address <= instruction[11:8];
                 decoded_rs_address <= instruction[7:4];
                 decoded_rt_address <= instruction[3:0];
@@ -92,6 +100,7 @@ module decoder (
                 decoded_ret <= 0;
 
                 // Raise the specific controls required by the chosen opcode.
+                // 这里的 `case` 是译码器最核心的部分：opcode 不同，整个数据通路的控制方式就不同。
                 case (instruction[15:12])
                     NOP: begin 
                         // NOP intentionally leaves every control signal deasserted.
@@ -133,6 +142,7 @@ module decoder (
                     LDR: begin 
                         // LDR both requests a memory read and later writes the returned value
                         // into rd through the MEMORY register-input mux path.
+                        // `decoded_reg_input_mux <= 2'b01` 的意思是让寄存器写回来源选到 LSU 输出。
                         decoded_reg_write_enable <= 1;
                         decoded_reg_input_mux <= 2'b01;
                         decoded_mem_read_enable <= 1;

@@ -8,6 +8,11 @@
 // > Beginner mental model:
 //   software says "launch N total threads"; dispatch groups them into chunks of
 //   THREADS_PER_BLOCK threads and assigns those chunks to the available cores.
+// 新手导读：
+// 1. dispatch 负责把“总线程数”切成一个个 block，并把 block 派给空闲 core。
+// 2. `total_blocks` 的计算用了向上取整思路，所以最后不满一个 block 的尾块也会被算进去。
+// 3. `core_start/core_reset/core_done` 组成了一组非常简化的核心级握手信号。
+// 4. 这个模块没有显式状态机名字，但本质上仍然是在每个时钟拍里做分发、回收和完成统计。
 module dispatch #(
     parameter NUM_CORES = 2,
     parameter THREADS_PER_BLOCK = 4
@@ -31,6 +36,7 @@ module dispatch #(
 );
     // Round up so partially full final blocks still count as one block.
     wire [7:0] total_blocks;
+    // `(a + b - 1) / b` 是整数除法里常见的向上取整公式。
     assign total_blocks = (thread_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
     // Global launch bookkeeping.
@@ -78,6 +84,7 @@ module dispatch #(
                         core_block_id[i] <= blocks_dispatched;
 
                         // Most blocks are full-sized. Only the final block may be partially full.
+                        // 三元运算符 `cond ? a : b` 的意思是：条件真时取 a，否则取 b。
                         core_thread_count[i] <= (blocks_dispatched == total_blocks - 1) 
                             ? thread_count - (blocks_dispatched * THREADS_PER_BLOCK)
                             : THREADS_PER_BLOCK;

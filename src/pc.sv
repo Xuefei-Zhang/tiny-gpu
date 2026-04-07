@@ -7,6 +7,12 @@
 //   but the scheduler later assumes all threads converge back to the same PC.
 // > The NZP register stores the result of the previous CMP instruction and is used
 //   by BRnzp to decide whether to branch.
+// 新手导读：
+// 1. `#(...)` 是参数列表，表示这个模块在实例化时可以被配置成不同位宽。
+// 2. 这个模块做两件事：一是在 EXECUTE 阶段算 next_pc，二是在 UPDATE 阶段更新 NZP 条件寄存器。
+// 3. `decoded_pc_mux` 可以把它理解为“下一条 PC 走顺序执行还是走分支跳转”的选择开关。
+// 4. `decoded_nzp` 是指令里写的分支条件掩码，`nzp` 是上一次 CMP 实际产生的条件标志。
+// 5. `&` 是按位与，不是逻辑与；这里用它判断“指令要求的条件位”和“当前已保存的条件位”是否有重合。
 module pc #(
     parameter DATA_MEM_DATA_BITS = 8,
     parameter PROGRAM_MEM_ADDR_BITS = 8
@@ -34,6 +40,7 @@ module pc #(
 
     // Internal NZP register for this thread.
     // Bit usage in this design follows the ALU's comparison packing.
+    // 每个线程 lane 都有自己独立的 nzp，因此不同线程理论上可以保留不同的分支条件状态。
     reg [2:0] nzp;
 
     always @(posedge clk) begin
@@ -47,6 +54,7 @@ module pc #(
                 if (decoded_pc_mux == 1) begin 
                     // BRnzp is selected. We branch if any requested NZP condition bit matches
                     // the stored NZP state from a previous CMP.
+                    // `!= 3'b0` 的意思是“按位与结果不是全 0”，也就是至少有一个条件位命中。
                     if (((nzp & decoded_nzp) != 3'b0)) begin 
                         // Take the branch by jumping to the immediate program address.
                         next_pc <= decoded_immediate;
@@ -65,6 +73,7 @@ module pc #(
                 // Only CMP-like instructions request an NZP update.
                 if (decoded_nzp_write_enable) begin
                     // Copy the ALU's low 3 comparison bits into the NZP register.
+                    // 这里逐位写入而不是整段赋值，只是为了把每一位语义写得更直观。
                     nzp[2] <= alu_out[2];
                     nzp[1] <= alu_out[1];
                     nzp[0] <= alu_out[0];

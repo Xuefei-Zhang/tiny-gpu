@@ -9,6 +9,12 @@
 // > Beginner mental model:
 //   many internal clients may want memory at the same time, but the outside world has only a
 //   few ports. This controller is the traffic cop that assigns channels and relays responses.
+// 新手导读：
+// 1. 这个模块是“仲裁器 + 转发器”：左边连很多消费者，右边连较少的 memory channel。
+// 2. 端口里像 `signal [NUM_CONSUMERS-1:0]` 这样的写法表示向量；像 `signal [NUM_CONSUMERS-1:0]` 后面再跟数组下标，则是数组端口。
+// 3. `current_consumer[i]` 记录“第 i 个外部通道当前在服务哪个内部客户端”。
+// 4. `channel_serving_consumer` 是一个位图，防止两个 channel 同时抢到同一个请求。
+// 5. 读懂这个模块的关键不是每一行赋值，而是先抓住每个 channel 都有自己的小状态机。
 module controller #(
     parameter ADDR_BITS = 8,
     parameter DATA_BITS = 16,
@@ -40,6 +46,7 @@ module controller #(
     input reg [NUM_CHANNELS-1:0] mem_write_ready
 );
     // Per-channel FSM states.
+    // 每个外部 memory channel 都会在这些状态之间独立切换。
     localparam IDLE = 3'b000, 
         READ_WAITING = 3'b010, 
         WRITE_WAITING = 3'b011,
@@ -47,6 +54,7 @@ module controller #(
         WRITE_RELAYING = 3'b101;
 
     // Each channel behaves like a tiny independent worker.
+    // `controller_state [NUM_CHANNELS-1:0]` 表示“每个通道各自保存一个状态值”。
     reg [2:0] controller_state [NUM_CHANNELS-1:0];
     reg [$clog2(NUM_CONSUMERS)-1:0] current_consumer [NUM_CHANNELS-1:0];
 
@@ -74,6 +82,7 @@ module controller #(
             channel_serving_consumer = 0;
         end else begin 
             // Process every external channel in parallel.
+            // 这里的 for 循环是在 RTL 中“复制相似逻辑到每个通道”，不是软件串行跑很多次的意思。
             for (int i = 0; i < NUM_CHANNELS; i = i + 1) begin 
                 case (controller_state[i])
                     IDLE: begin
@@ -81,6 +90,7 @@ module controller #(
                         for (int j = 0; j < NUM_CONSUMERS; j = j + 1) begin 
                             if (consumer_read_valid[j] && !channel_serving_consumer[j]) begin 
                                 // Claim this consumer so no other channel grabs it.
+                                // 这里用阻塞赋值 `=` 改位图，是想在本拍后续逻辑里立刻看到“已被占用”的效果。
                                 channel_serving_consumer[j] = 1;
                                 current_consumer[i] <= j;
 
@@ -129,6 +139,7 @@ module controller #(
                     // That "valid goes low" acts like an acknowledgement in this simple protocol.
                     READ_RELAYING: begin
                         if (!consumer_read_valid[current_consumer[i]]) begin 
+                            // 当消费者自己把 valid 拉低，说明这次读响应已经被它消费完了。
                             channel_serving_consumer[current_consumer[i]] = 0;
                             consumer_read_ready[current_consumer[i]] <= 0;
                             controller_state[i] <= IDLE;

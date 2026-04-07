@@ -9,6 +9,12 @@
 //   - This module is synchronous: it updates its output on the clock edge.
 //   - It only does useful work when the scheduler has moved the core into EXECUTE.
 //   - Every enabled thread has its own private ALU instance.
+// 新手导读：
+// 1. `module alu (...)` 表示定义一个独立硬件模块，圆括号里列的是它的输入输出端口。
+// 2. `input wire` / `output wire` 常用于“连线型”信号；`reg` 常用于 always 块里被时序逻辑保存的信号。
+// 3. `always @(posedge clk)` 表示“每个时钟上升沿执行一次下面的时序逻辑”，这是最常见的寄存器写法。
+// 4. `<=` 是非阻塞赋值，适合时序电路；可以把它理解成“本拍决定，拍沿统一更新”。
+// 5. 这个 ALU 不是组合逻辑直出，而是把结果先存进 `alu_out_reg`，所以输出会晚一个时钟边沿可见。
 module alu (
     input wire clk,
     input wire reset,
@@ -31,6 +37,7 @@ module alu (
     output wire [7:0] alu_out
 );
     // Small local encoding table for the arithmetic sub-operations.
+    // `localparam` 是“只在本模块内部可见的常量”，适合给状态码、操作码取名字。
     localparam ADD = 2'b00,
         SUB = 2'b01,
         MUL = 2'b10,
@@ -38,6 +45,7 @@ module alu (
 
     // Registered output: this ALU writes its result on the rising edge of clk.
     reg [7:0] alu_out_reg;
+    // `assign` 表示连续赋值，相当于把输出线永久连接到内部寄存器上。
     assign alu_out = alu_out_reg;
 
     always @(posedge clk) begin 
@@ -54,9 +62,11 @@ module alu (
                     //   alu_out[1] = (rs == rt)
                     //   alu_out[0] = (rs < rt)
                     // The upper 5 bits are padded with zeros because alu_out is 8 bits wide.
+                    // `{a, b, c}` 是拼接运算符，表示把多个 bit/向量按顺序拼成一个更宽的向量。
                     alu_out_reg <= {5'b0, (rs - rt > 0), (rs - rt == 0), (rs - rt < 0)};
                 end else begin 
                     // Normal arithmetic path selected by the decoder.
+                    // `case (...)` 很像软件里的 switch，用来根据选择信号挑一种子操作。
                     case (decoded_alu_arithmetic_mux)
                         ADD: begin 
                             // R[rd] = rs + rt

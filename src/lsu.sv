@@ -9,6 +9,11 @@
 //   - The decoder says whether the current instruction is a load or store.
 //   - The LSU starts a request during REQUEST/WAIT stages.
 //   - It waits for memory to answer, then reports completion back to the core.
+// 新手导读：
+// 1. LSU = Load Store Unit，负责把 LDR/STR 这样的指令翻译成真正的存储器握手信号。
+// 2. 这个模块内部有一个 4 状态小 FSM，所以一次 load/store 会跨多个时钟拍完成。
+// 3. 这里的 ready/valid 是和外部 memory controller 或 testbench memory model 对接的关键接口。
+// 4. `rs` 被约定为地址寄存器，`rt` 在 STR 指令里被当作要写出去的数据。
 module lsu (
     input wire clk,
     input wire reset,
@@ -47,6 +52,7 @@ module lsu (
     // REQUESTING -> request is being issued
     // WAITING    -> waiting for memory ready/response
     // DONE       -> request completed, waiting for core UPDATE to reset state
+    // 学习这类模块时，先看状态，再看每个状态下拉高了哪些握手信号，会更容易把时序串起来。
     localparam IDLE = 2'b00, REQUESTING = 2'b01, WAITING = 2'b10, DONE = 2'b11;
 
     always @(posedge clk) begin
@@ -62,6 +68,7 @@ module lsu (
         end else if (enable) begin
             // Handle LDR instruction flow.
             if (decoded_mem_read_enable) begin 
+                // 同一个 always 块里套 `case (lsu_state)`，就是标准“时序型状态机”的写法。
                 case (lsu_state)
                     IDLE: begin
                         // The scheduler has a dedicated REQUEST stage where the LSU is allowed
@@ -72,6 +79,7 @@ module lsu (
                     end
                     REQUESTING: begin 
                         // Raise the read request and present the address from rs.
+                        // 请求发出去后进入 WAITING，表示这笔事务已经在路上了。
                         mem_read_valid <= 1;
                         mem_read_address <= rs;
                         lsu_state <= WAITING;
@@ -97,6 +105,7 @@ module lsu (
 
             // Handle STR instruction flow.
             if (decoded_mem_write_enable) begin 
+                // store 和 load 复用同一套状态寄存器，只是握手信号方向不同。
                 case (lsu_state)
                     IDLE: begin
                         // Just like LDR, stores are launched from the REQUEST stage.

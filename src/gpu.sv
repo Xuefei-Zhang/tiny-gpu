@@ -11,6 +11,12 @@
 // > Beginner mental model:
 //   this file is mostly plumbing. It does not add new execution behavior so much as connect the
 //   major subsystems into one device.
+// 新手导读：
+// 1. 这是顶层模块，主要职责是“把子模块连起来”，而不是自己实现很多算法。
+// 2. 如果你第一次看大型 Verilog，建议先看端口区：那里定义了芯片对外暴露的所有接口。
+// 3. 然后看内部信号区：那里把 dispatch、controller、core 之间需要的中间连线列出来。
+// 4. 最后看实例化区：`xxx instance (...)` 就是在顶层里放入一个子模块，并把信号一根根接上。
+// 5. 这个文件里最容易卡住的新手点是数组端口和 generate 桥接逻辑，我在下面相应位置补了中文说明。
 module gpu #(
     parameter DATA_MEM_ADDR_BITS = 8,        // Number of bits in data memory address (256 rows)
     parameter DATA_MEM_DATA_BITS = 8,        // Number of bits in data memory value (8 bit data)
@@ -49,6 +55,7 @@ module gpu #(
     input wire [DATA_MEM_NUM_CHANNELS-1:0] data_mem_write_ready
 );
     // Launch metadata produced by the device control register.
+    // 从 DCR 读出来的 thread_count 会被 dispatch 拿去切分成若干 block。
     wire [7:0] thread_count;
 
     // Dispatcher-managed per-core launch/status signals.
@@ -60,6 +67,7 @@ module gpu #(
 
     // Flattened LSU <-> data-memory-controller wiring.
     // There is one LSU per thread slot per core, so total LSU count is NUM_CORES * THREADS_PER_BLOCK.
+    // `flattened` 的意思是：本来是“每个 core 里又有多个 lane”的二维结构，这里被摊平成一维数组方便 controller 统一仲裁。
     localparam NUM_LSUS = NUM_CORES * THREADS_PER_BLOCK;
     reg [NUM_LSUS-1:0] lsu_read_valid;
     reg [DATA_MEM_ADDR_BITS-1:0] lsu_read_address [NUM_LSUS-1:0];
@@ -71,6 +79,7 @@ module gpu #(
     reg [NUM_LSUS-1:0] lsu_write_ready;
 
     // Flattened fetcher <-> program-memory-controller wiring.
+    // 每个 core 只有一个 fetcher，所以 program memory 这边只需要按 core 数量展开。
     localparam NUM_FETCHERS = NUM_CORES;
     reg [NUM_FETCHERS-1:0] fetcher_read_valid;
     reg [PROGRAM_MEM_ADDR_BITS-1:0] fetcher_read_address [NUM_FETCHERS-1:0];
@@ -157,6 +166,7 @@ module gpu #(
 
     // Instantiate the compute cores and bridge each core's local LSU bundle into the flattened
     // global controller-facing LSU arrays.
+    // 这里的 generate 是顶层最关键的结构之一：它会生成 NUM_CORES 个 core，以及配套的桥接逻辑。
     genvar i;
     generate
         for (i = 0; i < NUM_CORES; i = i + 1) begin : cores
@@ -174,11 +184,13 @@ module gpu #(
 
             // Bridge this core's per-thread LSU ports into the flattened global LSU arrays.
             // lsu_index computes the unique global LSU slot for core i, thread lane j.
+            // 公式 `i * THREADS_PER_BLOCK + j` 很重要：它把二维坐标 `(core, lane)` 映射到一维索引。
             genvar j;
             for (j = 0; j < THREADS_PER_BLOCK; j = j + 1) begin
                 localparam lsu_index = i * THREADS_PER_BLOCK + j;
                 always @(posedge clk) begin 
                     // Core -> controller direction.
+                    // 这几行是在做“扁平化转接”：把 core 内部第 j 个 lane 的访存信号搬到全局第 lsu_index 槽位。
                     lsu_read_valid[lsu_index] <= core_lsu_read_valid[j];
                     lsu_read_address[lsu_index] <= core_lsu_read_address[j];
 
@@ -187,6 +199,7 @@ module gpu #(
                     lsu_write_data[lsu_index] <= core_lsu_write_data[j];
                     
                     // Controller -> core direction.
+                    // 返回路径同理：把 controller 的响应再送回该 core 的对应 lane。
                     core_lsu_read_ready[j] <= lsu_read_ready[lsu_index];
                     core_lsu_read_data[j] <= lsu_read_data[lsu_index];
                     core_lsu_write_ready[j] <= lsu_write_ready[lsu_index];

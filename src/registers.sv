@@ -11,6 +11,11 @@
 // > Beginner mental model:
 //   each generated thread gets its own little bank of registers, so all threads can run
 //   the same instruction at once but on different data.
+// 新手导读：
+// 1. 这个模块是“每个线程私有的一组寄存器”，所以同一个 core 里会实例化很多份。
+// 2. `reg [7:0] registers[15:0];` 要分两层看：左边 `[7:0]` 是每个元素的位宽，右边 `[15:0]` 是数组有 16 个元素。
+// 3. REQUEST 阶段负责读源操作数，UPDATE 阶段负责把 ALU/LSU/立即数写回目标寄存器。
+// 4. R13-R15 被设计成只读特殊寄存器，分别保存 blockIdx、blockDim、threadIdx。
 module registers #(
     parameter THREADS_PER_BLOCK = 4,
     parameter THREAD_ID = 0,
@@ -45,11 +50,13 @@ module registers #(
     output reg [7:0] rt
 );
     // Selects which producer writes back into rd during UPDATE.
+    // 这里相当于给“寄存器写回来源选择器”定义三个枚举值。
     localparam ARITHMETIC = 2'b00,
         MEMORY = 2'b01,
         CONSTANT = 2'b10;
 
     // Physical storage array for this one thread's architectural registers.
+    // 读法：16 个寄存器槽位，每个槽位 8 bit。
     reg [7:0] registers[15:0];
 
     always @(posedge clk) begin
@@ -80,11 +87,13 @@ module registers #(
             // Keep %blockIdx synchronized with the block currently assigned to this core.
             // The original author notes this is a simple-but-inelegant approach because it is
             // rewritten every cycle instead of only when a new block arrives.
+            // 这也说明寄存器并不一定只在“写回阶段”更新，某些特殊寄存器可以由控制逻辑持续维护。
             registers[13] <= block_id;
             
             // During REQUEST, snapshot the source operands named by the decoded instruction.
             // Those values will then feed the ALU / LSU in later stages.
             if (core_state == 3'b011) begin 
+                // 读寄存器在这里表现成“按地址索引数组”。
                 rs <= registers[decoded_rs_address];
                 rt <= registers[decoded_rt_address];
             end
@@ -93,6 +102,7 @@ module registers #(
             if (core_state == 3'b110) begin 
                 // Protect the three metadata registers by only allowing writes to R0-R12.
                 if (decoded_reg_write_enable && decoded_rd_address < 13) begin
+                    // `decoded_rd_address < 13` 用来保护 R13-R15，不允许普通指令把特殊寄存器覆盖掉。
                     case (decoded_reg_input_mux)
                         ARITHMETIC: begin 
                             // Arithmetic result from this thread's ALU.

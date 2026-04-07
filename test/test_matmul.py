@@ -8,7 +8,10 @@ from .helpers.format import format_cycle
 from .helpers.logger import logger
 
 
+# 这个测试文件验证的是“2x2 矩阵乘法”内核。
+# 和 matadd 相比，它更能覆盖分支、循环、乘法和多次 load/store 的组合行为。
 def parse_memwrite_records(log_contents: str):
+    # 和 matadd 里同名函数作用相同：把日志中的内存写事务解析成结构化记录。
     pattern = re.compile(
         r"^\[memwrite\] data cycle=(\d+) lane=(\d+) addr=(\d+) old=(\d+) new=(\d+)$"
     )
@@ -31,10 +34,15 @@ def parse_memwrite_records(log_contents: str):
 
 @cocotb.test()
 async def test_matadd(dut):
+    # 函数名虽然写成了 test_matadd，但因为有 `@cocotb.test()` 装饰器，它仍会被当作一个独立测试执行。
+    # 这里我只补解释，不改行为。
+
     # Program Memory
     program_memory = Memory(
         dut=dut, addr_bits=8, data_bits=16, channels=1, name="program"
     )
+    # 这段程序实现的是 2x2 矩阵乘法内核：
+    # 先根据线程号算出 row/col，再在 LOOP 里遍历 k，累加 A[row,k] * B[k,col]。
     program = [
         0b0101000011011110,  # MUL R0, %blockIdx, %blockDim
         0b0011000000001111,  # ADD R0, R0, %threadIdx         ; i = blockIdx * blockDim + threadIdx
@@ -81,6 +89,7 @@ async def test_matadd(dut):
     ]
 
     # Device Control
+    # 2x2 结果矩阵有 4 个元素，因此这里启动 4 个线程，每个线程负责一个输出位置。
     threads = 4
 
     await setup(
@@ -96,10 +105,12 @@ async def test_matadd(dut):
 
     cycles = 0
     while dut.done.value != 1:
+        # 仿真主循环的结构和 matadd 相同：先驱动 memory model，再读稳定信号，最后推进时钟。
         data_memory.run(cycle=cycles)
         program_memory.run()
 
         await cocotb.triggers.ReadOnly()
+        # 这里把 thread_id=1 传进去，表示只重点打印一个线程的详细内部状态，避免日志过大。
         format_cycle(dut, cycles, thread_id=1)
 
         await RisingEdge(dut.clk)
@@ -114,6 +125,7 @@ async def test_matadd(dut):
     memwrite_records = parse_memwrite_records(log_contents)
     expected_addresses = set(range(8, 12))
 
+    # 结果矩阵被约定写回到 data memory 的 8..11 地址范围。
     matching_records = [
         record for record in memwrite_records if record["addr"] in expected_addresses
     ]
@@ -126,6 +138,7 @@ async def test_matadd(dut):
     )
 
     # Assuming the matrices are 2x2 and the result is stored starting at address 9
+    # 先把一维 data 列表重新切成两个 2x2 矩阵，便于直接写出数学期望值。
     matrix_a = [data[0:2], data[2:4]]  # First matrix (2x2)
     matrix_b = [data[4:6], data[6:8]]  # Second matrix (2x2)
     expected_results = [
@@ -145,6 +158,7 @@ async def test_matadd(dut):
             f"Expected at least one memory write record old=0 new={expected} at address {i + 8}"
         )
 
+        # 和 matadd 一样，再直接检查最终 data memory 的实际落值。
         result = data_memory.memory[i + 8]  # Results start at address 9
         assert result == expected, (
             f"Result mismatch at index {i}: expected {expected}, got {result}"
