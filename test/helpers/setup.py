@@ -2,7 +2,9 @@ from typing import List
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge
+from .debug import maybe_enable_debugpy
 from .memory import Memory
+
 
 # 这个文件负责把“每个测试都要做的初始化步骤”收口到一个公共函数里。
 # 对新手来说，可以把它理解成：
@@ -12,15 +14,17 @@ from .memory import Memory
 # 4. 写 device control register，
 # 5. 拉起 start，正式开始跑 kernel。
 async def setup(
-    dut, 
-    program_memory: Memory, 
+    dut,
+    program_memory: Memory,
     program: List[int],
     data_memory: Memory,
     data: List[int],
-    threads: int
+    threads: int,
 ):
     # `async def` 表示这是一个协程函数。
     # 在 cocotb 里，协程非常常见，因为仿真需要“等一个时钟边沿再继续往下执行”。
+
+    maybe_enable_debugpy()
 
     # Setup Clock
     # `Clock(dut.clk, 25, units="us")` 的意思是给 dut.clk 这个信号挂一个周期为 25 微秒的时钟源。
