@@ -1,22 +1,32 @@
 `default_nettype none
 `timescale 1ns/1ns
 
-// GPU
-// > Top-level wrapper that wires together launch control, dispatch, cores, and memory controllers.
-// > Assumes software/testbench has already:
-//   1. loaded program memory,
-//   2. loaded data memory,
-//   3. written thread_count into the device control register,
-//   4. pulsed start.
-// > Beginner mental model:
-//   this file is mostly plumbing. It does not add new execution behavior so much as connect the
-//   major subsystems into one device.
-// 新手导读：
-// 1. 这是顶层模块，主要职责是“把子模块连起来”，而不是自己实现很多算法。
-// 2. 如果你第一次看大型 Verilog，建议先看端口区：那里定义了芯片对外暴露的所有接口。
-// 3. 然后看内部信号区：那里把 dispatch、controller、core 之间需要的中间连线列出来。
-// 4. 最后看实例化区：`xxx instance (...)` 就是在顶层里放入一个子模块，并把信号一根根接上。
-// 5. 这个文件里最容易卡住的新手点是数组端口和 generate 桥接逻辑，我在下面相应位置补了中文说明。
+// GPU ARCHITECTURE MAP
+// =====================
+// Top-level integration module for tiny-gpu.
+//
+// **Role:**
+//   - Wires together all major GPU subsystems: device control, dispatcher, compute cores, and memory controllers.
+//   - Does not implement computation itself, but connects and coordinates the submodules.
+//
+// **Beginner's Guide:**
+//   1. This file is the "plumbing" of the GPU. It connects the building blocks, but doesn't add new execution logic.
+//   2. Start by reading the port/interface section below to see how the GPU connects to the outside world.
+//   3. Next, look at the internal signal section, which defines how the submodules talk to each other.
+//   4. The submodule instantiation section shows how each subsystem is included and connected.
+//   5. Pay special attention to the generate/flattening logic at the end—this is where per-core and per-thread signals are mapped into global arrays for arbitration.
+//
+// **Dataflow Overview:**
+//   - The dispatcher splits a kernel launch into blocks and assigns them to available cores.
+//   - Each core executes one block at a time, with its own set of thread lanes.
+//   - All memory requests from all threads are flattened and arbitrated by the memory controllers.
+//   - The memory controllers relay requests/responses between the many internal clients and the limited external memory channels.
+//
+// **Key Concepts for Beginners:**
+//   - Array ports and generate blocks are used to scale up the design for multiple cores and threads.
+//   - Flattening logic bridges the gap between hierarchical (core/thread) and flat (controller-facing) signal structures.
+//   - Arbitration ensures that many internal requests can share a few external memory ports without conflict.
+
 module gpu #(
     parameter DATA_MEM_ADDR_BITS = 8,        // Number of bits in data memory address (256 rows)
     parameter DATA_MEM_DATA_BITS = 8,        // Number of bits in data memory value (8 bit data)
@@ -55,7 +65,6 @@ module gpu #(
     input wire [DATA_MEM_NUM_CHANNELS-1:0] data_mem_write_ready
 );
     // Launch metadata produced by the device control register.
-    // 从 DCR 读出来的 thread_count 会被 dispatch 拿去切分成若干 block。
     wire [7:0] thread_count;
 
     // Dispatcher-managed per-core launch/status signals.
@@ -65,9 +74,12 @@ module gpu #(
     reg [7:0] core_block_id [NUM_CORES-1:0];
     reg [$clog2(THREADS_PER_BLOCK):0] core_thread_count [NUM_CORES-1:0];
 
-    // Flattened LSU <-> data-memory-controller wiring.
-    // There is one LSU per thread slot per core, so total LSU count is NUM_CORES * THREADS_PER_BLOCK.
-    // `flattened` 的意思是：本来是“每个 core 里又有多个 lane”的二维结构，这里被摊平成一维数组方便 controller 统一仲裁。
+    // SECTION: LSU <-> Data Memory Controller (Flattened Wiring)
+    // ---------------------------------------------------------
+    // Each thread lane in each core has its own LSU (load/store unit).
+    // To arbitrate memory access, all LSUs are "flattened" into a single global array.
+    // This lets the controller treat all memory requests uniformly, regardless of which core/lane they came from.
+    // NUM_LSUS = NUM_CORES * THREADS_PER_BLOCK
     localparam NUM_LSUS = NUM_CORES * THREADS_PER_BLOCK;
     reg [NUM_LSUS-1:0] lsu_read_valid;
     reg [DATA_MEM_ADDR_BITS-1:0] lsu_read_address [NUM_LSUS-1:0];
@@ -78,8 +90,10 @@ module gpu #(
     reg [DATA_MEM_DATA_BITS-1:0] lsu_write_data [NUM_LSUS-1:0];
     reg [NUM_LSUS-1:0] lsu_write_ready;
 
-    // Flattened fetcher <-> program-memory-controller wiring.
-    // 每个 core 只有一个 fetcher，所以 program memory 这边只需要按 core 数量展开。
+    // SECTION: Fetcher <-> Program Memory Controller (Flattened Wiring)
+    // ---------------------------------------------------------------
+    // Each core has one fetcher for instruction memory.
+    // These are also flattened into a global array for arbitration by the program memory controller.
     localparam NUM_FETCHERS = NUM_CORES;
     reg [NUM_FETCHERS-1:0] fetcher_read_valid;
     reg [PROGRAM_MEM_ADDR_BITS-1:0] fetcher_read_address [NUM_FETCHERS-1:0];
@@ -164,15 +178,21 @@ module gpu #(
         .done(done)
     );
 
-    // Instantiate the compute cores and bridge each core's local LSU bundle into the flattened
-    // global controller-facing LSU arrays.
-    // 这里的 generate 是顶层最关键的结构之一：它会生成 NUM_CORES 个 core，以及配套的桥接逻辑。
+    // SECTION: Core Instantiation and LSU/Signal Flattening
+    // -----------------------------------------------------
+    // This generate block creates NUM_CORES compute cores.
+    // For each core, it:
+    //   - Declares local arrays for that core's per-thread LSU signals.
+    //   - Bridges each core's local LSU signals into the global flattened LSU arrays.
+    //     (This is done by mapping (core, lane) -> global LSU index.)
+    //   - Instantiates the core, wiring up all control and memory signals.
+    //
+    // The inner generate-for block is the key to understanding how hierarchical (core/lane) signals
+    // are mapped to flat controller-facing arrays for arbitration.
     genvar i;
     generate
         for (i = 0; i < NUM_CORES; i = i + 1) begin : cores
-            // OpenLane / Verilog-2005 compatibility note:
-            // separate local arrays are introduced here because that flow dislikes directly slicing
-            // some top-level packed/unpacked combinations when passing them into submodules.
+            // Local LSU arrays for this core (one per thread lane)
             reg [THREADS_PER_BLOCK-1:0] core_lsu_read_valid;
             reg [DATA_MEM_ADDR_BITS-1:0] core_lsu_read_address [THREADS_PER_BLOCK-1:0];
             reg [THREADS_PER_BLOCK-1:0] core_lsu_read_ready;
@@ -182,15 +202,13 @@ module gpu #(
             reg [DATA_MEM_DATA_BITS-1:0] core_lsu_write_data [THREADS_PER_BLOCK-1:0];
             reg [THREADS_PER_BLOCK-1:0] core_lsu_write_ready;
 
-            // Bridge this core's per-thread LSU ports into the flattened global LSU arrays.
-            // lsu_index computes the unique global LSU slot for core i, thread lane j.
-            // 公式 `i * THREADS_PER_BLOCK + j` 很重要：它把二维坐标 `(core, lane)` 映射到一维索引。
+            // Bridge this core's per-lane LSU ports into the flattened global LSU arrays.
+            // lsu_index maps the 2-D coordinate (core, lane) into one global LSU slot.
             genvar j;
             for (j = 0; j < THREADS_PER_BLOCK; j = j + 1) begin
                 localparam lsu_index = i * THREADS_PER_BLOCK + j;
                 always @(posedge clk) begin 
-                    // Core -> controller direction.
-                    // 这几行是在做“扁平化转接”：把 core 内部第 j 个 lane 的访存信号搬到全局第 lsu_index 槽位。
+                    // Core -> controller direction: move each lane's LSU signals into the global slot.
                     lsu_read_valid[lsu_index] <= core_lsu_read_valid[j];
                     lsu_read_address[lsu_index] <= core_lsu_read_address[j];
 
@@ -198,15 +216,14 @@ module gpu #(
                     lsu_write_address[lsu_index] <= core_lsu_write_address[j];
                     lsu_write_data[lsu_index] <= core_lsu_write_data[j];
                     
-                    // Controller -> core direction.
-                    // 返回路径同理：把 controller 的响应再送回该 core 的对应 lane。
+                    // Controller -> core direction: relay controller responses back to the correct lane.
                     core_lsu_read_ready[j] <= lsu_read_ready[lsu_index];
                     core_lsu_read_data[j] <= lsu_read_data[lsu_index];
                     core_lsu_write_ready[j] <= lsu_write_ready[lsu_index];
                 end
             end
 
-            // One compute core instance.
+            // Instantiate one compute core.
             core #(
                 .DATA_MEM_ADDR_BITS(DATA_MEM_ADDR_BITS),
                 .DATA_MEM_DATA_BITS(DATA_MEM_DATA_BITS),
