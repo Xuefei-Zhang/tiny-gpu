@@ -2,22 +2,19 @@
 `timescale 1ns/1ns
 
 // SCHEDULER
-// > Drives the per-instruction stage machine for one core processing one block.
-// > All active threads inside that core advance through the same high-level stages together.
-// > Stage sequence used by this simple design:
-//   1. FETCH   - request instruction from program memory
-//   2. DECODE  - turn instruction bits into control signals
-//   3. REQUEST - read source registers / launch LSU requests
-//   4. WAIT    - stall until any memory operations complete
-//   5. EXECUTE - compute ALU results and tentative next PCs
-//   6. UPDATE  - write registers/NZP and commit next PC
-// > Important simplification: the scheduler assumes all active threads reconverge to one PC.
-//   Real GPUs must handle branch divergence much more carefully.
-// 新手导读：
-// 1. 这个模块是一个“核心级大状态机”，决定一个 core 当前在取指、译码、访存还是回写。
-// 2. 它不是线程调度器意义上的复杂 GPU warp scheduler，而是这个教学工程里的每指令节拍控制器。
-// 3. 其他模块大多会看 `core_state`，只在指定阶段做自己的工作，所以你可以把它当成全局节拍器。
-// 4. `next_pc` 是一个数组，表示每个线程 lane 各自算出来的下一条 PC；这里最后只选一个代表值。
+//
+// The scheduler is the core-wide control FSM. It walks the whole core through a
+// simple six-stage instruction rhythm:
+//   FETCH -> DECODE -> REQUEST -> WAIT -> EXECUTE -> UPDATE
+//
+// Reading guide:
+// - FETCH waits for the fetcher.
+// - REQUEST/WAIT cover memory-side work.
+// - EXECUTE lets ALUs and PC logic produce results.
+// - UPDATE commits the results and advances to the next instruction.
+//
+// This toy GPU assumes all active lanes stay converged on one shared PC.
+
 module scheduler #(
     parameter THREADS_PER_BLOCK = 4,
 ) (
@@ -25,103 +22,99 @@ module scheduler #(
     input wire reset,
     input wire start,
     
-    // A few decoded instruction properties the scheduler cares about.
+    // Decoded instruction properties that affect stage transitions.
     input reg decoded_mem_read_enable,
     input reg decoded_mem_write_enable,
     input reg decoded_ret,
 
-    // Progress signals from the fetcher and per-thread LSUs.
+    // Progress signals from the fetcher and each thread lane's LSU.
     input reg [2:0] fetcher_state,
     input reg [1:0] lsu_state [THREADS_PER_BLOCK-1:0],
 
-    // The scheduler holds the converged current PC for the core and later chooses one next PC.
+    // Shared current PC plus each lane's proposed next PC.
     output reg [7:0] current_pc,
     input reg [7:0] next_pc [THREADS_PER_BLOCK-1:0],
 
-    // Shared execution stage broadcast to the rest of the core.
+    // Shared stage broadcast to the rest of the core.
     output reg [2:0] core_state,
     output reg done
 );
     // Core-wide stage encodings.
-    // 这些状态名帮助你把整个 core 的执行流程按时序串起来看。
-    localparam IDLE = 3'b000, // Waiting to start
+    localparam         IDLE = 3'b000, // Waiting to start (core is idle)
         FETCH = 3'b001,       // Fetch instructions from program memory
         DECODE = 3'b010,      // Decode instructions into control signals
         REQUEST = 3'b011,     // Request data from registers or memory
         WAIT = 3'b100,        // Wait for response from memory if necessary
         EXECUTE = 3'b101,     // Execute ALU and PC calculations
         UPDATE = 3'b110,      // Update registers, NZP, and PC
-        DONE = 3'b111;        // Done executing this block
+        DONE = 3'b111;        // Done executing this block (waiting for new work)
     
     always @(posedge clk) begin 
         if (reset) begin
+            // Reset the core-level control state.
             current_pc <= 0;
             core_state <= IDLE;
             done <= 0;
         end else begin 
-            // 典型有限状态机主干：当前状态不同，下一拍转移规则也不同。
+            // Main FSM transition logic.
             case (core_state)
                 IDLE: begin
-                    // Reset entry point before a block begins.
+                    // Wait here until the dispatcher starts a new block.
                     if (start) begin 
-                        // A new block starts at PC 0, so the first action is instruction fetch.
+                        // New blocks begin at PC 0.
                         core_state <= FETCH;
                     end
                 end
                 FETCH: begin 
-                    // Wait until the fetcher has latched the instruction.
+                    // Stay in FETCH until the fetcher has latched the instruction.
                     if (fetcher_state == 3'b010) begin 
                         core_state <= DECODE;
                     end
                 end
                 DECODE: begin
-                    // Decoder updates its outputs on this cycle's clock edge.
+                    // Let the decoder translate the fetched instruction.
                     core_state <= REQUEST;
                 end
                 REQUEST: begin 
-                    // Register operands are sampled and any LSU operations are launched here.
+                    // Operand reads and any memory requests begin from here.
                     core_state <= WAIT;
                 end
                 WAIT: begin
-                    // For non-memory instructions, the LSUs stay idle and this stage exits quickly.
-                    // For loads/stores, wait until every active LSU has finished.
-                    // 这里在 always 块内部声明局部变量，是 SystemVerilog 允许的写法。
+                    // Wait until all in-flight LSU operations have finished.
                     reg any_lsu_waiting = 1'b0;
                     for (int i = 0; i < THREADS_PER_BLOCK; i++) begin
-                        // REQUESTING or WAITING means this thread still has an in-flight memory op.
-                        // `for (...)` 在这里是“描述硬件中的重复检查逻辑”，不是软件里那种耗时循环概念。
+                        // REQUESTING or WAITING means this lane still has work outstanding.
                         if (lsu_state[i] == 2'b01 || lsu_state[i] == 2'b10) begin
                             any_lsu_waiting = 1'b1;
                             break;
                         end
                     end
 
-                    // Once all memory activity is settled, arithmetic / branch logic may proceed.
+                    // Once memory is settled, computation can proceed.
                     if (!any_lsu_waiting) begin
                         core_state <= EXECUTE;
                     end
                 end
                 EXECUTE: begin
-                    // ALUs and PCs compute their outputs during this stage.
+                    // ALUs and PC logic compute their outputs here.
                     core_state <= UPDATE;
                 end
                 UPDATE: begin 
+                    // Commit write-back state and choose the next shared PC.
                     if (decoded_ret) begin 
-                        // RET ends execution for the whole block in this simplified SIMD model.
+                        // In this simplified model, RET ends the whole block.
                         done <= 1;
                         core_state <= DONE;
                     end else begin 
-                        // Major simplification: just trust that all active threads computed the same
-                        // next PC, and pick one representative value.
-                        // 这里直接取 `next_pc[THREADS_PER_BLOCK-1]`，前提是所有活跃线程已经重新收敛到同一个控制流。
+                        // Assume all active lanes produced the same next PC and pick one copy.
                         current_pc <= next_pc[THREADS_PER_BLOCK-1];
 
-                        // Begin the next instruction.
+                        // Start the next instruction.
                         core_state <= FETCH;
                     end
                 end
                 DONE: begin 
-                    // Terminal state for this block until the dispatcher resets the core.
+                    // Terminal state until the dispatcher resets/restarts the core.
                 end
             endcase
         end
